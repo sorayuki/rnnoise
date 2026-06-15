@@ -130,6 +130,12 @@ const char *ready_state_name(WinMLEpReadyState state) {
   }
 }
 
+std::string format_hresult(HRESULT hr) {
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned>(hr));
+  return buf;
+}
+
 const char *device_type_name(OrtHardwareDeviceType type) {
   switch (type) {
     case OrtHardwareDeviceType_CPU: return "CPU";
@@ -160,11 +166,22 @@ BOOL CALLBACK collect_provider(WinMLEpHandle ep, const WinMLEpInfo *info, void *
   provider.ready_state = info != nullptr ? info->readyState : WinMLEpReadyState_NotPresent;
   provider.certification = info != nullptr ? info->certification : WinMLEpCertification_Unknown;
 
-  if (provider.ready_state == WinMLEpReadyState_NotReady && ep != nullptr) {
+  if (provider.ready_state != WinMLEpReadyState_Ready && ep != nullptr) {
+    std::fprintf(stderr, "rnnoise winml: ensuring catalog provider %s ready from %s\n",
+        provider.name.c_str(), ready_state_name(provider.ready_state));
     HRESULT hr = WinMLEpEnsureReady(ep);
     if (SUCCEEDED(hr)) {
       WinMLEpReadyState ready = WinMLEpReadyState_NotPresent;
-      if (SUCCEEDED(WinMLEpGetReadyState(ep, &ready))) provider.ready_state = ready;
+      hr = WinMLEpGetReadyState(ep, &ready);
+      if (SUCCEEDED(hr)) {
+        provider.ready_state = ready;
+      } else {
+        std::fprintf(stderr, "rnnoise winml: WinMLEpGetReadyState(%s) failed after EnsureReady: %s\n",
+            provider.name.c_str(), format_hresult(hr).c_str());
+      }
+    } else {
+      std::fprintf(stderr, "rnnoise winml: WinMLEpEnsureReady(%s) failed: %s\n",
+          provider.name.c_str(), format_hresult(hr).c_str());
     }
   }
   if (provider.ready_state == WinMLEpReadyState_Ready && ep != nullptr) {
