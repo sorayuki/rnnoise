@@ -7,6 +7,7 @@ option(RNNOISE_ENABLE_WINML "Use Windows ML for the RNN backend" ON)
 option(RNNOISE_ENABLE_ONNX "Use ONNX Runtime for the RNN backend" OFF)
 option(RNNOISE_COMPARE_RNN_BACKENDS "Run native CPU and external RNN backends together and compare outputs" OFF)
 set(RNNOISE_WINML_PACKAGE_ROOT "" CACHE PATH "Path to the Microsoft.Windows.AI.MachineLearning NuGet package root")
+set(RNNOISE_ONNXRUNTIME_ROOT "" CACHE PATH "Path to the ONNX Runtime native package root")
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -22,6 +23,7 @@ add_library(rnnoise STATIC
   src/parse_lpcnet_weights.c
   src/rnnoise_data.c
   src/rnnoise_tables.c
+  src/rnn_ort_common.cpp
 )
 
 if(RNNOISE_ENABLE_WINML)
@@ -41,8 +43,7 @@ if(RNNOISE_ENABLE_WINML)
   set(RNNOISE_WINML_SHARED_PROVIDERS_DLL "")
   foreach(_RNNOISE_SHARED_PROVIDER_CANDIDATE
       "${RNNOISE_WINML_NATIVE_DIR}/onnxruntime_providers_shared.dll"
-      "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk.ml/1.8.2091/runtimes-framework/win-x64/native/onnxruntime_providers_shared.dll"
-      "$ENV{USERPROFILE}/.nuget/packages/microsoft.ml.onnxruntime.foundry/1.23.2/runtimes/win-x64/native/onnxruntime_providers_shared.dll")
+      "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk.ml/1.8.2091/runtimes-framework/win-x64/native/onnxruntime_providers_shared.dll")
     if(EXISTS "${_RNNOISE_SHARED_PROVIDER_CANDIDATE}")
       set(RNNOISE_WINML_SHARED_PROVIDERS_DLL "${_RNNOISE_SHARED_PROVIDER_CANDIDATE}")
       break()
@@ -53,12 +54,28 @@ if(RNNOISE_ENABLE_WINML)
   target_compile_features(rnnoise PRIVATE cxx_std_17)
   target_link_libraries(rnnoise PUBLIC WindowsML::Api WindowsML::OnnxRuntime)
 elseif(RNNOISE_ENABLE_ONNX)
-  set(ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime_nuget")
+  if(NOT RNNOISE_ONNXRUNTIME_ROOT)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime_nuget/build/native/include/onnxruntime_c_api.h")
+      set(RNNOISE_ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime_nuget")
+    else()
+      file(GLOB _RNNOISE_ORT_PACKAGES
+        LIST_DIRECTORIES true
+        "$ENV{USERPROFILE}/.nuget/packages/microsoft.ml.onnxruntime/*")
+      if(_RNNOISE_ORT_PACKAGES)
+        list(SORT _RNNOISE_ORT_PACKAGES COMPARE NATURAL ORDER DESCENDING)
+        list(GET _RNNOISE_ORT_PACKAGES 0 RNNOISE_ONNXRUNTIME_ROOT)
+      else()
+        message(FATAL_ERROR "RNNOISE_ENABLE_ONNX requires ONNX Runtime. Set RNNOISE_ONNXRUNTIME_ROOT, vendor third_party/onnxruntime_nuget, or install Microsoft.ML.OnnxRuntime.")
+      endif()
+    endif()
+  endif()
+  set(ONNXRUNTIME_ROOT "${RNNOISE_ONNXRUNTIME_ROOT}")
   set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/build/native/include")
   set(ONNXRUNTIME_NATIVE_DIR "${ONNXRUNTIME_ROOT}/runtimes/win-x64/native")
-  target_sources(rnnoise PRIVATE src/rnn_onnx.c)
+  target_sources(rnnoise PRIVATE src/rnn_onnx.cpp)
   target_include_directories(rnnoise PRIVATE "${ONNXRUNTIME_INCLUDE_DIR}")
   target_compile_definitions(rnnoise PRIVATE RNNOISE_ENABLE_ONNX)
+  target_compile_features(rnnoise PRIVATE cxx_std_17)
   target_link_libraries(rnnoise PUBLIC "${ONNXRUNTIME_NATIVE_DIR}/onnxruntime.lib")
 endif()
 
@@ -73,6 +90,10 @@ target_include_directories(rnnoise
   PUBLIC include
   PRIVATE src
 )
+
+if(RNNOISE_ENABLE_ONNX)
+  target_include_directories(rnnoise PRIVATE "${ONNXRUNTIME_INCLUDE_DIR}")
+endif()
 
 target_compile_definitions(rnnoise
   PRIVATE

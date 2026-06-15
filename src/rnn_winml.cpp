@@ -12,33 +12,15 @@
 #define ENABLE_NPU_ADAPTER_ENUMERATION 1
 #include <WinMLEpCatalog.h>
 #include <winml/dml_provider_factory.h>
-#include <winml/onnxruntime_c_api.h>
+#include "onnxruntime_c_api.h"
 #include <winml/onnxruntime_session_options_config_keys.h>
 
 extern "C" {
+#include "rnn_ort_common.h"
 #include "rnn_winml.h"
 }
 
 namespace {
-
-static const char *input_names[] = {
-    "features",
-    "conv1_state",
-    "conv2_state",
-    "gru1_state",
-    "gru2_state",
-    "gru3_state",
-};
-
-static const char *output_names[] = {
-    "gains",
-    "vad",
-    "next_conv1_state",
-    "next_conv2_state",
-    "next_gru1_state",
-    "next_gru2_state",
-    "next_gru3_state",
-};
 
 struct RegisteredProvider {
   std::string name;
@@ -55,14 +37,12 @@ struct CatalogProvider {
 enum class SessionCandidate {
   Npu,
   MaxPerformance,
-  DirectMl,
   Cpu,
 };
 
 const SessionCandidate kCandidates[] = {
     SessionCandidate::Npu,
     SessionCandidate::MaxPerformance,
-    SessionCandidate::DirectMl,
     SessionCandidate::Cpu,
 };
 
@@ -108,11 +88,8 @@ std::wstring absolute_path(const char *path) {
 }
 
 bool check_status(WinMLState &state, OrtStatus *status, const char *what) {
-  if (status == nullptr) return true;
-  const char *msg = state.ort != nullptr ? state.ort->GetErrorMessage(status) : "unknown ONNX Runtime error";
-  std::fprintf(stderr, "rnnoise winml: %s failed: %s\n", what, msg);
-  if (state.ort != nullptr) state.ort->ReleaseStatus(status);
-  return false;
+  RnnOrtRuntime runtime = {state.ort, state.session, state.memory_info, "rnnoise winml"};
+  return rnn_ort_check_status(&runtime, status, what) == 0;
 }
 
 bool failed_hr(HRESULT hr, const char *what) {
@@ -393,40 +370,6 @@ bool try_create_max_performance_session(WinMLState &state) {
   return create_session(state, "MAX_PERFORMANCE auto EP selection");
 }
 
-bool try_create_directml_session(WinMLState &state) {
-  std::vector<const OrtEpDevice *> ep_devices = get_ep_devices(state);
-  for (const OrtEpDevice *ep_device : ep_devices) {
-    const char *ep_name = state.ort->EpDevice_EpName(ep_device);
-    if (!contains_case_insensitive(ep_name, "dml") && !contains_case_insensitive(ep_name, "directml")) continue;
-    std::string label = "DirectML via " + describe_ep_device(state, ep_device);
-    if (!create_options(state, false)) return false;
-    if (!append_ep_device(state, ep_device)) continue;
-    if (create_session(state, label.c_str())) return true;
-  }
-  const OrtDmlApi *dml_api = nullptr;
-  if (!create_options(state, false)) return false;
-  if (check_status(state,
-      state.ort->GetExecutionProviderApi("DML", ORT_API_VERSION, reinterpret_cast<const void **>(&dml_api)),
-      "GetExecutionProviderApi(DML)")) {
-    OrtDmlDeviceOptions device_options;
-    device_options.Preference = HighPerformance;
-    device_options.Filter = Gpu;
-    if (check_status(state,
-        dml_api->SessionOptionsAppendExecutionProvider_DML2(state.options, &device_options),
-        "SessionOptionsAppendExecutionProvider_DML2(GPU)")) {
-      if (create_session(state, "DirectML DML2 GPU high performance")) return true;
-    }
-    if (!create_options(state, false)) return false;
-    if (check_status(state,
-        dml_api->SessionOptionsAppendExecutionProvider_DML(state.options, 0),
-        "SessionOptionsAppendExecutionProvider_DML(0)")) {
-      if (create_session(state, "DirectML default adapter")) return true;
-    }
-  }
-  std::fprintf(stderr, "rnnoise winml: no DirectML device found\n");
-  return false;
-}
-
 bool try_create_cpu_session(WinMLState &state) {
   if (!create_options(state, false)) return false;
   return create_session(state, "CPU");
@@ -442,9 +385,6 @@ bool select_next_session(WinMLState &state) {
         break;
       case SessionCandidate::MaxPerformance:
         if (try_create_max_performance_session(state)) return true;
-        break;
-      case SessionCandidate::DirectMl:
-        if (try_create_directml_session(state)) return true;
         break;
       case SessionCandidate::Cpu:
         if (try_create_cpu_session(state)) return true;
@@ -494,65 +434,14 @@ int init_winml() {
   return 0;
 }
 
-bool make_tensor(float *data, size_t count, const int64_t *shape, size_t shape_len, OrtValue **value) {
-  return check_status(*g_state,
-      g_state->ort->CreateTensorWithDataAsOrtValue(g_state->memory_info, data, count * sizeof(float),
-          shape, shape_len, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, value),
-      "CreateTensorWithDataAsOrtValue");
-}
-
-bool copy_tensor(OrtValue *value, float *dst, size_t count) {
-  float *src = nullptr;
-  if (!check_status(*g_state, g_state->ort->GetTensorMutableData(value, reinterpret_cast<void **>(&src)),
-                    "GetTensorMutableData")) {
-    return false;
-  }
-  std::memcpy(dst, src, count * sizeof(float));
-  return true;
-}
-
 }  // namespace
 
 extern "C" int compute_rnn_winml(RNNState *rnn, float *gains, float *vad, const float *input) {
-  float features[CONV1_IN_SIZE];
-  std::memcpy(features, input, sizeof(features));
   if (init_winml()) return -1;
 
   while (g_state->session != nullptr) {
-    OrtValue *inputs[6] = {0};
-    OrtValue *outputs[7] = {0};
-    int64_t features_shape[2] = {1, CONV1_IN_SIZE};
-    int64_t conv1_state_shape[2] = {1, CONV1_STATE_SIZE};
-    int64_t conv2_state_shape[2] = {1, CONV2_STATE_SIZE};
-    int64_t gru_state_shape[2] = {1, GRU1_STATE_SIZE};
-    int ret = -1;
-
-    if (!make_tensor(features, CONV1_IN_SIZE, features_shape, 2, &inputs[0])) goto done;
-    if (!make_tensor(rnn->conv1_state, CONV1_STATE_SIZE, conv1_state_shape, 2, &inputs[1])) goto done;
-    if (!make_tensor(rnn->conv2_state, CONV2_STATE_SIZE, conv2_state_shape, 2, &inputs[2])) goto done;
-    if (!make_tensor(rnn->gru1_state, GRU1_STATE_SIZE, gru_state_shape, 2, &inputs[3])) goto done;
-    if (!make_tensor(rnn->gru2_state, GRU2_STATE_SIZE, gru_state_shape, 2, &inputs[4])) goto done;
-    if (!make_tensor(rnn->gru3_state, GRU3_STATE_SIZE, gru_state_shape, 2, &inputs[5])) goto done;
-
-    if (!check_status(*g_state,
-        g_state->ort->Run(g_state->session, nullptr, input_names,
-            reinterpret_cast<const OrtValue *const *>(inputs), 6, output_names, 7, outputs),
-        "Run")) {
-      goto done;
-    }
-
-    if (!copy_tensor(outputs[0], gains, DENSE_OUT_OUT_SIZE)) goto done;
-    if (!copy_tensor(outputs[1], vad, VAD_DENSE_OUT_SIZE)) goto done;
-    if (!copy_tensor(outputs[2], rnn->conv1_state, CONV1_STATE_SIZE)) goto done;
-    if (!copy_tensor(outputs[3], rnn->conv2_state, CONV2_STATE_SIZE)) goto done;
-    if (!copy_tensor(outputs[4], rnn->gru1_state, GRU1_STATE_SIZE)) goto done;
-    if (!copy_tensor(outputs[5], rnn->gru2_state, GRU2_STATE_SIZE)) goto done;
-    if (!copy_tensor(outputs[6], rnn->gru3_state, GRU3_STATE_SIZE)) goto done;
-    ret = 0;
-
-done:
-    for (int i = 0; i < 6; ++i) if (inputs[i] != nullptr) g_state->ort->ReleaseValue(inputs[i]);
-    for (int i = 0; i < 7; ++i) if (outputs[i] != nullptr) g_state->ort->ReleaseValue(outputs[i]);
+    RnnOrtRuntime runtime = {g_state->ort, g_state->session, g_state->memory_info, "rnnoise winml"};
+    int ret = rnn_ort_run_session(&runtime, rnn, gains, vad, input);
     if (ret == 0) return 0;
 
     std::fprintf(stderr, "rnnoise winml: evaluate on %s failed, trying next device\n",
