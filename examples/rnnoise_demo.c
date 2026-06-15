@@ -26,6 +26,11 @@
 */
 
 #include <stdio.h>
+#include <string.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 #include "rnnoise.h"
 
 #define FRAME_SIZE 480
@@ -47,8 +52,38 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: %s <noisy speech> <output denoised>\n", argv[0]);
     return 1;
   }
-  f1 = fopen(argv[1], "rb");
-  fout = fopen(argv[2], "wb");
+  if (strcmp(argv[1], "-") == 0) {
+#ifdef _WIN32
+    if (_setmode(_fileno(stdin), _O_BINARY) == -1) {
+      fprintf(stderr, "failed to set stdin to binary mode\n");
+      return 1;
+    }
+#endif
+    f1 = stdin;
+  } else {
+    f1 = fopen(argv[1], "rb");
+  }
+  if (strcmp(argv[2], "-") == 0) {
+#ifdef _WIN32
+    if (_setmode(_fileno(stdout), _O_BINARY) == -1) {
+      fprintf(stderr, "failed to set stdout to binary mode\n");
+      if (f1 != stdin) fclose(f1);
+      return 1;
+    }
+#endif
+    fout = stdout;
+  } else {
+    fout = fopen(argv[2], "wb");
+  }
+  if (f1 == NULL) {
+    fprintf(stderr, "failed to open input file: %s\n", argv[1]);
+    return 1;
+  }
+  if (fout == NULL) {
+    fprintf(stderr, "failed to open output file: %s\n", argv[2]);
+    if (f1 != stdin) fclose(f1);
+    return 1;
+  }
   while (1) {
     short tmp[FRAME_SIZE];
     fread(tmp, sizeof(short), FRAME_SIZE, f1);
@@ -60,8 +95,8 @@ int main(int argc, char **argv) {
     first = 0;
   }
   rnnoise_destroy(st);
-  fclose(f1);
-  fclose(fout);
+  if (f1 != stdin) fclose(f1);
+  if (fout != stdout) fclose(fout);
 #ifdef USE_WEIGHTS_FILE
   rnnoise_model_free(model);
 #endif

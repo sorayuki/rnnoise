@@ -1,5 +1,9 @@
 import argparse
 import re
+import subprocess
+import sys
+import tempfile
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +69,37 @@ def dense_matrix(text, name, nb_inputs, nb_outputs, sparse, recurrent):
             weights[i, hidden + i] += diag[hidden + i]
             weights[i, 2 * hidden + i] += diag[2 * hidden + i]
     return weights.astype(np.float32), bias.astype(np.float32)
+
+
+def remove_unused_opset_imports(model):
+    used_domains = {node.domain for node in model.graph.node}
+    del model.opset_import[:]
+    for domain, version in [("", 13)]:
+        if domain in used_domains or domain == "":
+            model.opset_import.append(helper.make_operatorsetid(domain, version))
+
+
+def optimize_model(input_path, output_path):
+    code = """
+import sys
+import onnxruntime as ort
+
+session_options = ort.SessionOptions()
+session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+session_options.optimized_model_filepath = sys.argv[2]
+ort.InferenceSession(sys.argv[1], session_options, providers=["CPUExecutionProvider"])
+"""
+    try:
+        subprocess.run([sys.executable, "-c", code, str(input_path), str(output_path)], check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("ONNX Runtime failed to optimize the model") from exc
+
+    model = onnx.load(output_path)
+    remove_unused_opset_imports(model)
+    # Windows.AI.MachineLearning on this SDK/runtime accepts models up to IR v9.
+    model.ir_version = 9
+    onnx.checker.check_model(model)
+    onnx.save(model, output_path)
 
 
 class Builder:
@@ -146,6 +181,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-c", default="src/rnnoise_data.c")
     parser.add_argument("--output", default="models/rnnoise_rnn.onnx")
+    parser.add_argument("--no-optimize", action="store_true", help="write the raw exported graph without ONNX Runtime optimization")
     args = parser.parse_args()
 
     text = Path(args.data_c).read_text(encoding="utf-8")
@@ -205,8 +241,21 @@ def main():
     # Windows.AI.MachineLearning on this SDK/runtime accepts models up to IR v9.
     model.ir_version = 9
     onnx.checker.check_model(model)
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    onnx.save(model, args.output)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.no_optimize:
+        onnx.save(model, output_path)
+    else:
+        with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+            raw_path = Path(tmp.name)
+        try:
+            onnx.save(model, raw_path)
+            optimize_model(raw_path, output_path)
+        finally:
+            try:
+                raw_path.unlink(missing_ok=True)
+            except PermissionError:
+                warnings.warn(f"could not remove temporary ONNX file: {raw_path}", RuntimeWarning)
     print(args.output)
 
 

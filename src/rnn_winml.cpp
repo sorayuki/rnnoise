@@ -583,3 +583,77 @@ extern "C" void rnn_winml_shutdown(void) {
   g_state.reset();
   g_init_attempted = false;
 }
+
+struct ListCatalogContext {
+  const char *ensure_selector = nullptr;
+  size_t index = 0;
+  bool matched = false;
+};
+
+BOOL CALLBACK list_catalog_provider(WinMLEpHandle ep, const WinMLEpInfo *info, void *context) {
+  auto *ctx = static_cast<ListCatalogContext *>(context);
+  const char *name = info != nullptr && info->name != nullptr ? info->name : "";
+  const char *path = info != nullptr && info->libraryPath != nullptr ? info->libraryPath : "";
+  WinMLEpReadyState ready = info != nullptr ? info->readyState : WinMLEpReadyState_NotPresent;
+
+  std::printf("[%zu] name=%s ready=%s path=%s\n",
+      ctx->index,
+      name[0] != '\0' ? name : "<unknown>",
+      ready_state_name(ready),
+      path[0] != '\0' ? path : "<none>");
+
+  if (ctx->ensure_selector != nullptr && ctx->ensure_selector[0] != '\0') {
+    bool should_ensure = false;
+    char *end = nullptr;
+    unsigned long selected_index = std::strtoul(ctx->ensure_selector, &end, 10);
+    if (end != ctx->ensure_selector && *end == '\0') {
+      should_ensure = ctx->index == static_cast<size_t>(selected_index);
+    } else {
+      should_ensure = contains_case_insensitive(name, ctx->ensure_selector) ||
+          contains_case_insensitive(path, ctx->ensure_selector);
+    }
+    if (should_ensure) {
+      ctx->matched = true;
+      if (ep != nullptr) {
+        std::fprintf(stderr, "rnnoise winml: ensuring provider [%zu] %s\n", ctx->index, name);
+        HRESULT hr = WinMLEpEnsureReady(ep);
+        if (SUCCEEDED(hr)) {
+          WinMLEpReadyState updated = WinMLEpReadyState_NotPresent;
+          if (SUCCEEDED(WinMLEpGetReadyState(ep, &updated))) {
+            std::printf("[%zu] after ensure ready=%s\n", ctx->index, ready_state_name(updated));
+          }
+        } else {
+          std::fprintf(stderr, "rnnoise winml: WinMLEpEnsureReady(%s) failed: %s\n",
+              name, format_hresult(hr).c_str());
+        }
+      }
+    }
+  }
+
+  ctx->index++;
+  return TRUE;
+}
+
+extern "C" int rnn_winml_list_execution_providers(const char *ensure_selector) {
+  WinMLEpCatalogHandle catalog = nullptr;
+  HRESULT hr = WinMLEpCatalogCreate(&catalog);
+  if (FAILED(hr)) {
+    std::fprintf(stderr, "rnnoise winml: WinMLEpCatalogCreate failed: %s\n", format_hresult(hr).c_str());
+    return 1;
+  }
+
+  std::printf("Windows ML catalog execution providers:\n");
+  ListCatalogContext ctx;
+  ctx.ensure_selector = ensure_selector;
+  hr = WinMLEpCatalogEnumProviders(catalog, list_catalog_provider, &ctx);
+  WinMLEpCatalogRelease(catalog);
+  if (FAILED(hr)) {
+    std::fprintf(stderr, "rnnoise winml: WinMLEpCatalogEnumProviders failed: %s\n", format_hresult(hr).c_str());
+    return 1;
+  }
+  if (ensure_selector != nullptr && ensure_selector[0] != '\0' && !ctx.matched) {
+    std::fprintf(stderr, "rnnoise winml: no provider matched selector: %s\n", ensure_selector);
+    return 2;
+  }
+  return 0;
+}

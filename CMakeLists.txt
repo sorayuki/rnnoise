@@ -37,6 +37,17 @@ if(RNNOISE_ENABLE_WINML)
   endif()
   list(APPEND CMAKE_PREFIX_PATH "${RNNOISE_WINML_PACKAGE_ROOT}/build/cmake")
   find_package(microsoft.windows.ai.machinelearning CONFIG REQUIRED)
+  set(RNNOISE_WINML_NATIVE_DIR "${RNNOISE_WINML_PACKAGE_ROOT}/runtimes/win-x64/native")
+  set(RNNOISE_WINML_SHARED_PROVIDERS_DLL "")
+  foreach(_RNNOISE_SHARED_PROVIDER_CANDIDATE
+      "${RNNOISE_WINML_NATIVE_DIR}/onnxruntime_providers_shared.dll"
+      "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk.ml/1.8.2091/runtimes-framework/win-x64/native/onnxruntime_providers_shared.dll"
+      "$ENV{USERPROFILE}/.nuget/packages/microsoft.ml.onnxruntime.foundry/1.23.2/runtimes/win-x64/native/onnxruntime_providers_shared.dll")
+    if(EXISTS "${_RNNOISE_SHARED_PROVIDER_CANDIDATE}")
+      set(RNNOISE_WINML_SHARED_PROVIDERS_DLL "${_RNNOISE_SHARED_PROVIDER_CANDIDATE}")
+      break()
+    endif()
+  endforeach()
   target_sources(rnnoise PRIVATE src/rnn_winml.cpp)
   target_compile_definitions(rnnoise PRIVATE RNNOISE_ENABLE_WINML)
   target_compile_features(rnnoise PRIVATE cxx_std_17)
@@ -81,6 +92,11 @@ if(RNNOISE_BUILD_EXAMPLES)
   target_link_libraries(rnnoise_demo PRIVATE rnnoise)
   target_compile_definitions(rnnoise_demo PRIVATE _CRT_SECURE_NO_WARNINGS)
   if(RNNOISE_ENABLE_WINML)
+    add_executable(rnnoise_winml_ep_tool tools/rnnoise_winml_ep_tool.cpp)
+    target_link_libraries(rnnoise_winml_ep_tool PRIVATE rnnoise)
+    target_include_directories(rnnoise_winml_ep_tool PRIVATE src)
+    target_compile_features(rnnoise_winml_ep_tool PRIVATE cxx_std_17)
+
     add_custom_command(TARGET rnnoise_demo POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:WindowsML::Api>"
@@ -92,6 +108,31 @@ if(RNNOISE_BUILD_EXAMPLES)
         "${WINML_DIRECTML_DLL}"
         "$<TARGET_FILE_DIR:rnnoise_demo>/DirectML.dll"
     )
+    if(RNNOISE_WINML_SHARED_PROVIDERS_DLL)
+      add_custom_command(TARGET rnnoise_demo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${RNNOISE_WINML_SHARED_PROVIDERS_DLL}"
+          "$<TARGET_FILE_DIR:rnnoise_demo>/onnxruntime_providers_shared.dll"
+      )
+    endif()
+    add_custom_command(TARGET rnnoise_winml_ep_tool POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:WindowsML::Api>"
+        "$<TARGET_FILE_DIR:rnnoise_winml_ep_tool>/Microsoft.Windows.AI.MachineLearning.dll"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:WindowsML::OnnxRuntime>"
+        "$<TARGET_FILE_DIR:rnnoise_winml_ep_tool>/onnxruntime.dll"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${WINML_DIRECTML_DLL}"
+        "$<TARGET_FILE_DIR:rnnoise_winml_ep_tool>/DirectML.dll"
+    )
+    if(RNNOISE_WINML_SHARED_PROVIDERS_DLL)
+      add_custom_command(TARGET rnnoise_winml_ep_tool POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${RNNOISE_WINML_SHARED_PROVIDERS_DLL}"
+          "$<TARGET_FILE_DIR:rnnoise_winml_ep_tool>/onnxruntime_providers_shared.dll"
+      )
+    endif()
   elseif(RNNOISE_ENABLE_ONNX)
     add_custom_command(TARGET rnnoise_demo POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
