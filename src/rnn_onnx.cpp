@@ -82,10 +82,16 @@ int init_onnx() {
 
 }  // namespace
 
-extern "C" int compute_rnn_onnx(RNNState *rnn, float *gains, float *vad, const float *input) {
+extern "C" int compute_rnn_onnx(
+    RNNState *rnn,
+    float *gains,
+    float *vad,
+    const float *analysis_window,
+    const float *pitch_window,
+    int pitch_index) {
   if (init_onnx()) return -1;
   RnnOrtRuntime runtime = runtime_view();
-  return rnn_ort_run_session(&runtime, rnn, gains, vad, input);
+  return rnn_ort_run_session(&runtime, rnn, gains, vad, analysis_window, pitch_window, pitch_index);
 }
 
 extern "C" void rnn_onnx_shutdown(void) {

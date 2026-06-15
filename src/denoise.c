@@ -397,7 +397,8 @@ void rnn_frame_analysis(DenoiseState *st, kiss_fft_cpx *X, float *Ex, const floa
 }
 
 int rnn_compute_frame_features(DenoiseState *st, kiss_fft_cpx *X, kiss_fft_cpx *P,
-                                  float *Ex, float *Ep, float *Exp, float *features, const float *in) {
+                                  float *Ex, float *Ep, float *Exp, float *features, const float *in,
+                                  float *analysis_window, float *pitch_window, int *pitch_index_out) {
   int i;
   float E = 0;
   float Ly[NB_BANDS];
@@ -407,6 +408,10 @@ int rnn_compute_frame_features(DenoiseState *st, kiss_fft_cpx *X, kiss_fft_cpx *
   float gain;
   float *(pre[1]);
   float follow, logMax;
+  if (analysis_window != NULL) {
+    RNN_COPY(analysis_window, st->analysis_mem, FRAME_SIZE);
+    RNN_COPY(&analysis_window[FRAME_SIZE], in, FRAME_SIZE);
+  }
   rnn_frame_analysis(st, X, Ex, in);
   RNN_MOVE(st->pitch_buf, &st->pitch_buf[FRAME_SIZE], PITCH_BUF_SIZE-FRAME_SIZE);
   RNN_COPY(&st->pitch_buf[PITCH_BUF_SIZE-FRAME_SIZE], in, FRAME_SIZE);
@@ -420,8 +425,10 @@ int rnn_compute_frame_features(DenoiseState *st, kiss_fft_cpx *X, kiss_fft_cpx *
           PITCH_FRAME_SIZE, &pitch_index, st->last_period, st->last_gain);
   st->last_period = pitch_index;
   st->last_gain = gain;
+  if (pitch_index_out != NULL) *pitch_index_out = pitch_index;
   for (i=0;i<WINDOW_SIZE;i++)
     p[i] = st->pitch_buf[PITCH_BUF_SIZE-WINDOW_SIZE-pitch_index+i];
+  if (pitch_window != NULL) RNN_COPY(pitch_window, p, WINDOW_SIZE);
   apply_window(p);
   forward_transform(P, p);
   compute_band_energy(Ep, P);
@@ -448,6 +455,7 @@ int rnn_compute_frame_features(DenoiseState *st, kiss_fft_cpx *X, kiss_fft_cpx *
   features[1] -= 4;
   return TRAINING && E < 0.1;
 }
+
 
 static void frame_synthesis(DenoiseState *st, float *out, const kiss_fft_cpx *y) {
   float x[WINDOW_SIZE];
@@ -521,12 +529,17 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
   static const float a_hp[2] = {-1.99599, 0.99600};
   static const float b_hp[2] = {-2, 1};
   rnn_biquad(x, st->mem_hp_x, in, b_hp, a_hp, FRAME_SIZE);
-  silence = rnn_compute_frame_features(st, X, P, Ex, Ep, Exp, features, x);
+  {
+    float analysis_window[WINDOW_SIZE];
+    float pitch_window[WINDOW_SIZE];
+    int pitch_index = 0;
+    silence = rnn_compute_frame_features(st, X, P, Ex, Ep, Exp, features, x,
+        analysis_window, pitch_window, &pitch_index);
 
-  if (!silence) {
+    if (!silence) {
 #if !TRAINING
 #if defined(RNNOISE_ENABLE_EXTERNAL_RNN) && !defined(RNNOISE_COMPARE_RNN_BACKENDS)
-    if (!st->external_failed && compute_rnn_external(&st->rnn, g, &vad_prob, features) != 0) {
+    if (!st->external_failed && compute_rnn_external(&st->rnn, g, &vad_prob, analysis_window, pitch_window, pitch_index) != 0) {
       if (rnnoise_external_strict_required()) {
         fprintf(stderr, "rnnoise %s: strict external backend required; aborting instead of falling back\n",
             RNN_EXTERNAL_NAME);
@@ -544,7 +557,7 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
     if (!st->external_failed) {
       float external_g[NB_BANDS];
       float external_vad = 0;
-      if (compute_rnn_external(&st->external_rnn, external_g, &external_vad, features) == 0) {
+      if (compute_rnn_external(&st->external_rnn, external_g, &external_vad, analysis_window, pitch_window, pitch_index) == 0) {
         float max_gain_diff = 0;
         float vad_diff;
         st->external_frames++;
@@ -571,6 +584,9 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
 #endif
 #endif
 #endif
+    }
+  }
+  if (!silence) {
     rnn_pitch_filter(st->delayed_X, st->delayed_P, st->delayed_Ex, st->delayed_Ep, st->delayed_Exp, g);
     for (i=0;i<NB_BANDS;i++) {
       float alpha = .6f;

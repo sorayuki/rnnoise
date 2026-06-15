@@ -40,6 +40,16 @@ enum class SessionCandidate {
   Cpu,
 };
 
+enum class ForcedSessionKind {
+  Auto,
+  Npu,
+  MaxPerformance,
+  Cpu,
+  Dml,
+  OpenVino,
+  NvTensorRtx,
+};
+
 const SessionCandidate kCandidates[] = {
     SessionCandidate::Npu,
     SessionCandidate::MaxPerformance,
@@ -129,6 +139,38 @@ bool contains_case_insensitive(const char *text, const char *needle) {
   std::transform(lhs.begin(), lhs.end(), lhs.begin(), [](unsigned char c) { return (char)std::tolower(c); });
   std::transform(rhs.begin(), rhs.end(), rhs.begin(), [](unsigned char c) { return (char)std::tolower(c); });
   return lhs.find(rhs) != std::string::npos;
+}
+
+ForcedSessionKind parse_forced_session_kind(const char *value) {
+  if (value == nullptr || value[0] == '\0') return ForcedSessionKind::Auto;
+  if (contains_case_insensitive(value, "auto")) return ForcedSessionKind::Auto;
+  if (contains_case_insensitive(value, "npu")) return ForcedSessionKind::Npu;
+  if (contains_case_insensitive(value, "max")) return ForcedSessionKind::MaxPerformance;
+  if (contains_case_insensitive(value, "cpu")) return ForcedSessionKind::Cpu;
+  if (contains_case_insensitive(value, "dml") || contains_case_insensitive(value, "directml")) {
+    return ForcedSessionKind::Dml;
+  }
+  if (contains_case_insensitive(value, "openvino")) return ForcedSessionKind::OpenVino;
+  if (contains_case_insensitive(value, "nvtensor") ||
+      contains_case_insensitive(value, "trt") ||
+      contains_case_insensitive(value, "tensorrt")) {
+    return ForcedSessionKind::NvTensorRtx;
+  }
+  std::fprintf(stderr, "rnnoise winml: unknown RNNOISE_WINML_EP=%s, falling back to auto\n", value);
+  return ForcedSessionKind::Auto;
+}
+
+const char *forced_session_kind_name(ForcedSessionKind kind) {
+  switch (kind) {
+    case ForcedSessionKind::Auto: return "auto";
+    case ForcedSessionKind::Npu: return "npu";
+    case ForcedSessionKind::MaxPerformance: return "max_performance";
+    case ForcedSessionKind::Cpu: return "cpu";
+    case ForcedSessionKind::Dml: return "directml";
+    case ForcedSessionKind::OpenVino: return "openvino";
+    case ForcedSessionKind::NvTensorRtx: return "nvtensorrtx";
+    default: return "unknown";
+  }
 }
 
 void trim_trailing_nulls(std::string &value) {
@@ -268,6 +310,11 @@ std::vector<const OrtEpDevice *> get_ep_devices(WinMLState &state) {
   return out;
 }
 
+bool ep_name_contains(WinMLState &state, const OrtEpDevice *ep_device, const char *needle) {
+  const char *ep_name = state.ort->EpDevice_EpName(ep_device);
+  return contains_case_insensitive(ep_name, needle);
+}
+
 bool append_ep_device(WinMLState &state, const OrtEpDevice *ep_device) {
   const OrtEpDevice *devices[] = {ep_device};
   return check_status(state,
@@ -375,6 +422,8 @@ bool try_create_cpu_session(WinMLState &state) {
   return create_session(state, "CPU");
 }
 
+bool select_forced_session(WinMLState &state, ForcedSessionKind forced_kind);
+
 bool select_next_session(WinMLState &state) {
   while (state.next_candidate < sizeof(kCandidates) / sizeof(kCandidates[0])) {
     SessionCandidate candidate = kCandidates[state.next_candidate++];
@@ -394,6 +443,63 @@ bool select_next_session(WinMLState &state) {
   return false;
 }
 
+bool try_create_named_gpu_session(WinMLState &state, const char *ep_name_substring, const char *label_prefix) {
+  std::vector<const OrtEpDevice *> ep_devices = get_ep_devices(state);
+  for (const OrtEpDevice *ep_device : ep_devices) {
+    const OrtHardwareDevice *device = state.ort->EpDevice_Device(ep_device);
+    if (state.ort->HardwareDevice_Type(device) != OrtHardwareDeviceType_GPU) continue;
+    if (!ep_name_contains(state, ep_device, ep_name_substring)) continue;
+    std::string label = std::string(label_prefix) + describe_ep_device(state, ep_device);
+    if (!create_options(state, true)) return false;
+    if (!append_ep_device(state, ep_device)) continue;
+    if (create_session(state, label.c_str())) return true;
+  }
+  std::fprintf(stderr, "rnnoise winml: no GPU EP device matched %s\n", ep_name_substring);
+  return false;
+}
+
+bool try_create_dml_session(WinMLState &state) {
+  return try_create_named_gpu_session(state, "DmlExecutionProvider", "DirectML via ");
+}
+
+bool try_create_openvino_session(WinMLState &state) {
+  std::vector<const OrtEpDevice *> ep_devices = get_ep_devices(state);
+  for (const OrtEpDevice *ep_device : ep_devices) {
+    if (!ep_name_contains(state, ep_device, "OpenVINOExecutionProvider")) continue;
+    std::string label = "OpenVINO via " + describe_ep_device(state, ep_device);
+    if (!create_options(state, true)) return false;
+    if (!append_ep_device(state, ep_device)) continue;
+    if (create_session(state, label.c_str())) return true;
+  }
+  std::fprintf(stderr, "rnnoise winml: no EP device matched OpenVINOExecutionProvider\n");
+  return false;
+}
+
+bool try_create_nv_tensorrt_rtx_session(WinMLState &state) {
+  return try_create_named_gpu_session(state, "NvTensorRTRTXExecutionProvider", "NvTensorRTRTX via ");
+}
+
+bool select_forced_session(WinMLState &state, ForcedSessionKind forced_kind) {
+  switch (forced_kind) {
+    case ForcedSessionKind::Auto:
+      return select_next_session(state);
+    case ForcedSessionKind::Npu:
+      return try_create_npu_session(state);
+    case ForcedSessionKind::MaxPerformance:
+      return try_create_max_performance_session(state);
+    case ForcedSessionKind::Cpu:
+      return try_create_cpu_session(state);
+    case ForcedSessionKind::Dml:
+      return try_create_dml_session(state);
+    case ForcedSessionKind::OpenVino:
+      return try_create_openvino_session(state);
+    case ForcedSessionKind::NvTensorRtx:
+      return try_create_nv_tensorrt_rtx_session(state);
+    default:
+      return false;
+  }
+}
+
 int init_winml() {
   if (g_state && g_state->initialized) return 0;
   if (g_init_attempted) return -1;
@@ -409,6 +515,9 @@ int init_winml() {
   const char *model_path = std::getenv("RNNOISE_WINML_MODEL");
   if (model_path == nullptr || model_path[0] == '\0') model_path = "models/rnnoise_rnn.onnx";
   state->model_path = absolute_path(model_path);
+  const char *forced_ep = std::getenv("RNNOISE_WINML_EP");
+  ForcedSessionKind forced_kind = parse_forced_session_kind(forced_ep);
+  std::fprintf(stderr, "rnnoise winml: session selector %s\n", forced_session_kind_name(forced_kind));
 
   if (!check_status(*state, state->ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "rnnoise-winml", &state->env),
                     "CreateEnv")) {
@@ -422,7 +531,7 @@ int init_winml() {
     return -1;
   }
   register_catalog_providers(*state);
-  if (!select_next_session(*state)) {
+  if (!select_forced_session(*state, forced_kind)) {
     g_state = std::move(state);
     rnn_winml_shutdown();
     return -1;
@@ -436,12 +545,18 @@ int init_winml() {
 
 }  // namespace
 
-extern "C" int compute_rnn_winml(RNNState *rnn, float *gains, float *vad, const float *input) {
+extern "C" int compute_rnn_winml(
+    RNNState *rnn,
+    float *gains,
+    float *vad,
+    const float *analysis_window,
+    const float *pitch_window,
+    int pitch_index) {
   if (init_winml()) return -1;
 
   while (g_state->session != nullptr) {
     RnnOrtRuntime runtime = {g_state->ort, g_state->session, g_state->memory_info, "rnnoise winml"};
-    int ret = rnn_ort_run_session(&runtime, rnn, gains, vad, input);
+    int ret = rnn_ort_run_session(&runtime, rnn, gains, vad, analysis_window, pitch_window, pitch_index);
     if (ret == 0) return 0;
 
     std::fprintf(stderr, "rnnoise winml: evaluate on %s failed, trying next device\n",
