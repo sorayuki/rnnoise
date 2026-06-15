@@ -41,7 +41,37 @@
 #include "pitch.h"
 #include "arch.h"
 #include "rnn.h"
+#ifdef RNNOISE_ENABLE_WINML
+#include "rnn_winml.h"
+#elif defined(RNNOISE_ENABLE_ONNX)
+#include "rnn_onnx.h"
+#endif
 #include "cpu_support.h"
+
+#ifdef RNNOISE_ENABLE_WINML
+#define RNN_EXTERNAL_NAME "winml"
+#define compute_rnn_external compute_rnn_winml
+#define rnn_external_shutdown rnn_winml_shutdown
+#define RNN_EXTERNAL_USE_ENV "RNNOISE_USE_WINML"
+#elif defined(RNNOISE_ENABLE_ONNX)
+#define RNN_EXTERNAL_NAME "onnx"
+#define compute_rnn_external compute_rnn_onnx
+#define rnn_external_shutdown rnn_onnx_shutdown
+#define RNN_EXTERNAL_USE_ENV "RNNOISE_USE_ONNX"
+#endif
+
+#if defined(RNNOISE_ENABLE_WINML) || defined(RNNOISE_ENABLE_ONNX)
+#define RNNOISE_ENABLE_EXTERNAL_RNN 1
+#endif
+
+static int rnnoise_external_strict_required(void) {
+#ifdef RNNOISE_ENABLE_WINML
+  const char *require_npu = getenv("RNNOISE_WINML_REQUIRE_NPU");
+  return require_npu != NULL && require_npu[0] != '\0';
+#else
+  return 0;
+#endif
+}
 
 #define SQUARE(x) ((x)*(x))
 
@@ -80,6 +110,16 @@ struct DenoiseState {
   float mem_hp_x[2];
   float lastg[NB_BANDS];
   RNNState rnn;
+#if defined(RNNOISE_ENABLE_EXTERNAL_RNN)
+  int external_failed;
+#endif
+#if defined(RNNOISE_ENABLE_EXTERNAL_RNN) && defined(RNNOISE_COMPARE_RNN_BACKENDS)
+  RNNState external_rnn;
+  unsigned external_frames;
+  unsigned external_mismatch_frames;
+  float external_max_gain_diff;
+  float external_max_vad_diff;
+#endif
   kiss_fft_cpx delayed_X[FREQ_SIZE];
   kiss_fft_cpx delayed_P[FREQ_SIZE];
   float delayed_Ex[NB_BANDS], delayed_Ep[NB_BANDS];
@@ -321,6 +361,18 @@ DenoiseState *rnnoise_create(RNNModel *model) {
 }
 
 void rnnoise_destroy(DenoiseState *st) {
+#if defined(RNNOISE_ENABLE_EXTERNAL_RNN) && defined(RNNOISE_COMPARE_RNN_BACKENDS)
+  if (st->external_frames > 0) {
+    fprintf(stderr, "rnnoise %s compare: frames=%u max_gain_diff=%.9g max_vad_diff=%.9g mismatches=%u result=%s\n",
+        RNN_EXTERNAL_NAME, st->external_frames, st->external_max_gain_diff, st->external_max_vad_diff,
+        st->external_mismatch_frames, st->external_mismatch_frames == 0 ? "PASS" : "FAIL");
+  } else if (st->external_failed) {
+    fprintf(stderr, "rnnoise %s compare: unavailable\n", RNN_EXTERNAL_NAME);
+  }
+#endif
+#if defined(RNNOISE_ENABLE_EXTERNAL_RNN)
+  rnn_external_shutdown();
+#endif
   free(st);
 }
 
@@ -473,7 +525,51 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
 
   if (!silence) {
 #if !TRAINING
+#if defined(RNNOISE_ENABLE_EXTERNAL_RNN) && !defined(RNNOISE_COMPARE_RNN_BACKENDS)
+    if (!st->external_failed && compute_rnn_external(&st->rnn, g, &vad_prob, features) != 0) {
+      if (rnnoise_external_strict_required()) {
+        fprintf(stderr, "rnnoise %s: strict external backend required; aborting instead of falling back\n",
+            RNN_EXTERNAL_NAME);
+        exit(2);
+      }
+      fprintf(stderr, "rnnoise %s: unavailable, falling back to native cpu backend\n", RNN_EXTERNAL_NAME);
+      st->external_failed = 1;
+    }
+    if (st->external_failed) {
+      compute_rnn(&st->model, &st->rnn, g, &vad_prob, features, st->arch);
+    }
+#else
     compute_rnn(&st->model, &st->rnn, g, &vad_prob, features, st->arch);
+#if defined(RNNOISE_ENABLE_EXTERNAL_RNN) && defined(RNNOISE_COMPARE_RNN_BACKENDS)
+    if (!st->external_failed) {
+      float external_g[NB_BANDS];
+      float external_vad = 0;
+      if (compute_rnn_external(&st->external_rnn, external_g, &external_vad, features) == 0) {
+        float max_gain_diff = 0;
+        float vad_diff;
+        st->external_frames++;
+        for (i=0;i<NB_BANDS;i++) {
+          float diff = (float)fabs(g[i] - external_g[i]);
+          if (diff > max_gain_diff) max_gain_diff = diff;
+        }
+        vad_diff = (float)fabs(vad_prob - external_vad);
+        if (max_gain_diff > st->external_max_gain_diff) st->external_max_gain_diff = max_gain_diff;
+        if (vad_diff > st->external_max_vad_diff) st->external_max_vad_diff = vad_diff;
+        if (max_gain_diff > 1e-5f || vad_diff > 1e-5f) st->external_mismatch_frames++;
+        if (st->external_frames <= 5 || max_gain_diff > 1e-4f || vad_diff > 1e-4f) {
+          fprintf(stderr, "rnnoise %s compare frame=%u gain_diff=%.9g vad_diff=%.9g\n",
+              RNN_EXTERNAL_NAME, st->external_frames, max_gain_diff, vad_diff);
+        }
+        if (getenv(RNN_EXTERNAL_USE_ENV) != NULL) {
+          RNN_COPY(g, external_g, NB_BANDS);
+          vad_prob = external_vad;
+        }
+      } else {
+        st->external_failed = 1;
+      }
+    }
+#endif
+#endif
 #endif
     rnn_pitch_filter(st->delayed_X, st->delayed_P, st->delayed_Ex, st->delayed_Ep, st->delayed_Exp, g);
     for (i=0;i<NB_BANDS;i++) {
