@@ -29,9 +29,7 @@ int rnn_ort_run_session(
     RNNState *rnn,
     float *gains,
     float *vad,
-    const float *analysis_window,
-    const float *pitch_window,
-    int64_t pitch_index);
+    const float *features);
 
 #ifdef __cplusplus
 }

@@ -7,9 +7,7 @@ int compute_rnn_winml(
     RNNState *rnn,
     float *gains,
     float *vad,
-    const float *analysis_window,
-    const float *pitch_window,
-    int pitch_index);
+    const float *features);
 void rnn_winml_shutdown(void);
 int rnn_winml_list_execution_providers(const char *ensure_selector);
 

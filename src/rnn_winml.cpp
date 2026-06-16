@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -171,6 +173,29 @@ const char *forced_session_kind_name(ForcedSessionKind kind) {
     case ForcedSessionKind::NvTensorRtx: return "nvtensorrtx";
     default: return "unknown";
   }
+}
+
+bool read_ep_device_index(size_t *index) {
+  const char *env_name = "RNNOISE_WINML_EP_DEVICE_INDEX";
+  const char *value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0') {
+    env_name = "RNNOISE_WINML_DEVICE_INDEX";
+    value = std::getenv(env_name);
+  }
+  if (value == nullptr || value[0] == '\0') return false;
+
+  char *end = nullptr;
+  errno = 0;
+  unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || errno == ERANGE ||
+      parsed > static_cast<unsigned long long>((std::numeric_limits<size_t>::max)())) {
+    std::fprintf(stderr, "rnnoise winml: invalid %s=%s, ignoring device index\n", env_name, value);
+    return false;
+  }
+
+  *index = static_cast<size_t>(parsed);
+  std::fprintf(stderr, "rnnoise winml: forced EP device index %zu from %s\n", *index, env_name);
+  return true;
 }
 
 void trim_trailing_nulls(std::string &value) {
@@ -479,6 +504,23 @@ bool try_create_nv_tensorrt_rtx_session(WinMLState &state) {
   return try_create_named_gpu_session(state, "NvTensorRTRTXExecutionProvider", "NvTensorRTRTX via ");
 }
 
+bool try_create_indexed_ep_device_session(WinMLState &state, size_t index) {
+  std::vector<const OrtEpDevice *> ep_devices = get_ep_devices(state);
+  if (index >= ep_devices.size()) {
+    std::fprintf(stderr, "rnnoise winml: EP device index %zu out of range, %zu device(s) available\n",
+        index, ep_devices.size());
+    return false;
+  }
+
+  const OrtEpDevice *ep_device = ep_devices[index];
+  const OrtHardwareDevice *device = state.ort->EpDevice_Device(ep_device);
+  std::string label = "EP device index " + std::to_string(index) + " via " + describe_ep_device(state, ep_device);
+  bool disable_cpu_fallback = state.ort->HardwareDevice_Type(device) != OrtHardwareDeviceType_CPU;
+  if (!create_options(state, disable_cpu_fallback)) return false;
+  if (!append_ep_device(state, ep_device)) return false;
+  return create_session(state, label.c_str());
+}
+
 bool select_forced_session(WinMLState &state, ForcedSessionKind forced_kind) {
   switch (forced_kind) {
     case ForcedSessionKind::Auto:
@@ -518,6 +560,8 @@ int init_winml() {
   const char *forced_ep = std::getenv("RNNOISE_WINML_EP");
   ForcedSessionKind forced_kind = parse_forced_session_kind(forced_ep);
   std::fprintf(stderr, "rnnoise winml: session selector %s\n", forced_session_kind_name(forced_kind));
+  size_t forced_device_index = 0;
+  bool has_forced_device_index = read_ep_device_index(&forced_device_index);
 
   if (!check_status(*state, state->ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "rnnoise-winml", &state->env),
                     "CreateEnv")) {
@@ -531,7 +575,12 @@ int init_winml() {
     return -1;
   }
   register_catalog_providers(*state);
-  if (!select_forced_session(*state, forced_kind)) {
+  if (has_forced_device_index && forced_kind != ForcedSessionKind::Auto) {
+    std::fprintf(stderr, "rnnoise winml: EP device index overrides RNNOISE_WINML_EP\n");
+  }
+  if (has_forced_device_index
+      ? !try_create_indexed_ep_device_session(*state, forced_device_index)
+      : !select_forced_session(*state, forced_kind)) {
     g_state = std::move(state);
     rnn_winml_shutdown();
     return -1;
@@ -549,14 +598,12 @@ extern "C" int compute_rnn_winml(
     RNNState *rnn,
     float *gains,
     float *vad,
-    const float *analysis_window,
-    const float *pitch_window,
-    int pitch_index) {
+    const float *features) {
   if (init_winml()) return -1;
 
   while (g_state->session != nullptr) {
     RnnOrtRuntime runtime = {g_state->ort, g_state->session, g_state->memory_info, "rnnoise winml"};
-    int ret = rnn_ort_run_session(&runtime, rnn, gains, vad, analysis_window, pitch_window, pitch_index);
+    int ret = rnn_ort_run_session(&runtime, rnn, gains, vad, features);
     if (ret == 0) return 0;
 
     std::fprintf(stderr, "rnnoise winml: evaluate on %s failed, trying next device\n",

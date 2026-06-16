@@ -56,7 +56,7 @@ int init_onnx() {
   if (rnn_ort_check_status(&runtime, status, "CreateEnv")) return -1;
   status = g_state.ort->CreateSessionOptions(&g_state.options);
   if (rnn_ort_check_status(&runtime, status, "CreateSessionOptions")) return -1;
-  status = g_state.ort->SetSessionGraphOptimizationLevel(g_state.options, ORT_DISABLE_ALL);
+  status = g_state.ort->SetSessionGraphOptimizationLevel(g_state.options, ORT_ENABLE_ALL);
   if (rnn_ort_check_status(&runtime, status, "SetSessionGraphOptimizationLevel")) return -1;
 
   model_path = std::getenv("RNNOISE_ONNX_MODEL");
@@ -86,12 +86,10 @@ extern "C" int compute_rnn_onnx(
     RNNState *rnn,
     float *gains,
     float *vad,
-    const float *analysis_window,
-    const float *pitch_window,
-    int pitch_index) {
+    const float *features) {
   if (init_onnx()) return -1;
   RnnOrtRuntime runtime = runtime_view();
-  return rnn_ort_run_session(&runtime, rnn, gains, vad, analysis_window, pitch_window, pitch_index);
+  return rnn_ort_run_session(&runtime, rnn, gains, vad, features);
 }
 
 extern "C" void rnn_onnx_shutdown(void) {

@@ -31,6 +31,19 @@ PCM files sampled at 48 kHz. It can be used as:
 The output is also a 16-bit raw PCM file.
 NOTE AGAIN, THE INPUT and OUTPUT ARE IN RAW FORMAT, NOT WAV.
 
+== Windows ML Runtime Selection ==
+
+When built with RNNOISE_ENABLE_WINML, the Windows ML/ONNX Runtime RNN backend
+is enabled by default. Set RNNOISE_USE_WINML=0 to force the original native CPU
+RNN path.
+
+The runtime execution provider can be selected with RNNOISE_WINML_EP. Supported
+values include auto, npu, max, cpu, directml/dml, openvino, and tensorrt/trt.
+For exact EP device selection, set RNNOISE_WINML_EP_DEVICE_INDEX to the index
+printed in the "rnnoise winml: ep device N" log. RNNOISE_WINML_DEVICE_INDEX is
+accepted as a shorter alias. An explicit device index overrides
+RNNOISE_WINML_EP.
+
 The latest version of the source is available from
 https://gitlab.xiph.org/xiph/rnnoise .  The GitHub repository
 is a convenience copy.

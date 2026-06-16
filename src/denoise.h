@@ -53,5 +53,4 @@ void rnn_pitch_filter(kiss_fft_cpx *X, const kiss_fft_cpx *P, const float *Ex, c
 void rnn_frame_analysis(DenoiseState *st, kiss_fft_cpx *X, float *Ex, const float *in);
 
 int rnn_compute_frame_features(DenoiseState *st, kiss_fft_cpx *X, kiss_fft_cpx *P,
-                                  float *Ex, float *Ep, float *Exp, float *features, const float *in,
-                                  float *analysis_window, float *pitch_window, int *pitch_index_out);
+                                  float *Ex, float *Ep, float *Exp, float *features, const float *in);
